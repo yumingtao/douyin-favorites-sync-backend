@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.git/
+.gitignore
+*.md
+*.db
+*.db-shm
+*.db-wal
+cookie.txt
+cookie.json
+*.json
+!requirements*.txt
+output/
+data/
+.DS_Store
