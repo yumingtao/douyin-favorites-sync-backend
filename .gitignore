@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Runtime / sensitive data
+cookie.txt
+cookie.json
+backend-config.json
+backend-history.json
+content-index.json
+phase0_output.json
+douyin-sync.db
+douyin-sync.db-shm
+douyin-sync.db-wal
+output/
+data/
+
+# Environment
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime log (nohup output)
+backend.log
+
+# Runtime debug log
+pyarmor.bug.log

@@ -1,0 +1,4 @@
+# Heavy mode dependencies (optional)
+# Install with: pip install -r requirements-heavy.txt
+faster-whisper>=1.0.3
+zhconv>=1.4.3
