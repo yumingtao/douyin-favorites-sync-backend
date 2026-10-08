@@ -6,23 +6,27 @@ Provides:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlencode
 
 import httpx
 
 from .douyin_client import (
-    BASE_PARAMS,
-    USER_AGENT,
+    COLLECTION_BASE_PARAMS,
+    SIGN_SESSION_UA,
     DouyinClient,
     Settings,
     cookie_value,
     random_mstoken,
     read_cookie,
+    resolve_sign_asset,
+    sign_url_with_recovery,
     signed_query,
 )
 from .transcriber import transcribe_media
@@ -54,7 +58,7 @@ def _resolve_short_url(client: httpx.Client, url: str) -> str:
     if "v.douyin.com" not in url and "iesdouyin.com" not in url:
         return url
     resp = client.get(url, follow_redirects=True, headers={
-        "User-Agent": USER_AGENT,
+        "User-Agent": SIGN_SESSION_UA,
     })
     return str(resp.url)
 
@@ -72,48 +76,101 @@ def _extract_aweme_id(final_url: str) -> str:
     return ""
 
 
-def _resolve_detail(aweme_id: str, settings: Settings) -> dict[str, Any]:
-    """Call Douyin web detail API to get video metadata."""
+async def _resolve_detail(aweme_id: str, settings: Settings) -> dict[str, Any]:
+    """Call Douyin web detail API to get video metadata.
+
+    Uses the same session-aware request flow as the collection API
+    to ensure consistent compatibility.
+    """
     client_obj = DouyinClient(settings)
     cookie = read_cookie(settings)
+    uifid = cookie_value(cookie, "UIFID")
 
-    params = BASE_PARAMS.copy()
+    # 使用出签会话一致的参数集（HeadlessChrome 151），而非 BASE_PARAMS（Windows Chrome 139）
+    params = dict(COLLECTION_BASE_PARAMS)
     params["aweme_id"] = aweme_id
-    params["msToken"] = cookie_value(cookie, "msToken") or ""
-    # 签名与传输均为 GET（与浏览器一致）；msToken 缺失时留空
-    query = signed_query(client_obj.abogus, params, method="GET")
+    params["msToken"] = cookie_value(cookie, "msToken") or random_mstoken()
 
+    # 解析 webid（与收藏接口一致）
+    webid = settings.webid or await resolve_sign_asset("webid", "DOUYIN_WEBID")
+    if not webid:
+        from .douyin_client import SignSessionError
+        raise SignSessionError(
+            "webid 无法解析：请设置 DOUYIN_WEBID，或确保出签浏览器会话可用于自动提取"
+        )
+    params["webid"] = webid
+    if uifid:
+        params["uifid"] = uifid
+
+    # 本地 a_bogus 签名（用 collection_abogus，UA 与出签会话一致）
+    query = urlencode(params, quote_via=quote)
+    a_bogus = client_obj.collection_abogus.get_value(query, "GET")
+    base_url = (
+        f"https://www.douyin.com/aweme/v1/web/aweme/detail/?"
+        f"{query}&a_bogus={quote(a_bogus, safe='')}"
+    )
+
+    # 浏览器会话内出签（带会话自愈），与收藏接口一致
+    signed_url = await sign_url_with_recovery(base_url)
+
+    # 请求头必须与出签会话 UA 保持一致
     headers = {
-        "Accept": "*/*",
+        "Accept": "application/json, text/plain, */*",
         "Accept-Encoding": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "Cookie": cookie,
         "Origin": "https://www.douyin.com",
         "Referer": f"https://www.douyin.com/video/{aweme_id}",
-        "User-Agent": USER_AGENT,
+        "User-Agent": SIGN_SESSION_UA,
     }
+    if uifid:
+        headers["uifid"] = uifid
+    headers["x-secsdk-csrf-token"] = "DOWNGRADE"
 
     max_attempts = 2
     for attempt in range(1, max_attempts + 1):
-        with httpx.Client(timeout=20) as client:
-            resp = client.get(
-                f"https://www.douyin.com/aweme/v1/web/aweme/detail/?{query}",
+        async with httpx.AsyncClient(timeout=20) as client:
+            # 与收藏接口一样使用 POST 方法
+            resp = await client.post(
+                signed_url,
+                content=f"aweme_id={aweme_id}",
                 headers=headers,
             )
+            if resp.status_code == 403:
+                # 403 临时拦截：等待后重试（重新出签）
+                if attempt < max_attempts:
+                    await asyncio.sleep(8)
+                    signed_url = await sign_url_with_recovery(base_url)
+                    continue
+                raise ExtractNotAvailableError(
+                    f"detail API returned 403 Forbidden after {max_attempts} attempts for aweme_id={aweme_id}"
+                )
+            if resp.status_code == 401:
+                raise ExtractNotAvailableError(
+                    f"detail API returned 401 (auth_expired) for aweme_id={aweme_id}"
+                )
             resp.raise_for_status()
+            # 200 + 纯文本 "blocked"：软拦截
+            if resp.text.strip() == "blocked":
+                if attempt < max_attempts:
+                    await asyncio.sleep(8)
+                    signed_url = await sign_url_with_recovery(base_url)
+                    continue
+                raise ExtractNotAvailableError(
+                    f"detail API returned 'blocked' after {max_attempts} attempts for aweme_id={aweme_id}"
+                )
             try:
                 return resp.json()
             except json.JSONDecodeError as exc:
                 preview = resp.text[:300].replace("\n", "\\n")
                 if attempt < max_attempts and (not resp.text.strip() or "<" in resp.text[:50]):
-                    # Likely rate-limited (empty or HTML response) — wait and retry once
-                    import time
-                    time.sleep(10)
+                    await asyncio.sleep(10)
+                    signed_url = await sign_url_with_recovery(base_url)
                     continue
                 raise ExtractNotAvailableError(
                     f"detail API returned non-JSON (HTTP {resp.status_code}): {preview}"
                 ) from exc
 
-    # Should not reach here, but just in case
     raise ExtractNotAvailableError(
         f"detail API returned non-JSON after {max_attempts} attempts for aweme_id={aweme_id}"
     )
@@ -162,7 +219,7 @@ def _parse_detail(raw: dict[str, Any], aweme_id: str, source_url: str) -> Douyin
     )
 
 
-def resolve_douyin_share(url: str, settings: Settings) -> DouyinMeta:
+async def resolve_douyin_share(url: str, settings: Settings) -> DouyinMeta:
     """Resolve a Douyin share URL to metadata."""
     with httpx.Client(timeout=20) as client:
         final_url = _resolve_short_url(client, url)
@@ -173,7 +230,7 @@ def resolve_douyin_share(url: str, settings: Settings) -> DouyinMeta:
             f"Could not extract aweme_id from URL: {final_url}"
         )
 
-    raw = _resolve_detail(aweme_id, settings)
+    raw = await _resolve_detail(aweme_id, settings)
     return _parse_detail(raw, aweme_id, url)
 
 
@@ -186,7 +243,7 @@ def download_video(url: str, dest: Path, settings: Settings) -> bool:
     """Download a video from *url* to *dest*. Returns True on success."""
     cookie = read_cookie(settings)
     headers = {
-        "User-Agent": USER_AGENT,
+        "User-Agent": SIGN_SESSION_UA,
         "Referer": "https://www.douyin.com/",
         "Cookie": cookie,
     }
@@ -222,10 +279,10 @@ def _get_settings() -> Settings:
     return Settings.from_root(root)
 
 
-def extract_light(url: str) -> dict[str, Any]:
+async def extract_light(url: str) -> dict[str, Any]:
     """Light extraction: resolve URL to metadata without downloading video."""
     settings = _get_settings()
-    meta = resolve_douyin_share(url, settings)
+    meta = await resolve_douyin_share(url, settings)
     return {
         "douyin_id": meta.aweme_id,
         "video_url": meta.download_url or None,
@@ -240,7 +297,7 @@ def extract_light(url: str) -> dict[str, Any]:
     }
 
 
-def extract_heavy(url: str, output_dir: Path, *, whisper_model: str = "small") -> dict[str, Any]:
+async def extract_heavy(url: str, output_dir: Path, *, whisper_model: str = "small") -> dict[str, Any]:
     """Heavy extraction: resolve + download video + transcribe audio."""
     try:
         import faster_whisper  # noqa: F401
@@ -251,7 +308,7 @@ def extract_heavy(url: str, output_dir: Path, *, whisper_model: str = "small") -
         ) from exc
 
     settings = _get_settings()
-    meta = resolve_douyin_share(url, settings)
+    meta = await resolve_douyin_share(url, settings)
     aweme_id = meta.aweme_id or "unknown"
     out_dir = output_dir / f"{aweme_id}_{meta.author or 'unknown'}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -286,7 +343,7 @@ def extract_heavy(url: str, output_dir: Path, *, whisper_model: str = "small") -
             try:
                 with httpx.Client(timeout=30, follow_redirects=True) as client:
                     resp = client.get(img_url, headers={
-                        "User-Agent": USER_AGENT,
+                        "User-Agent": SIGN_SESSION_UA,
                         "Referer": "https://www.douyin.com/",
                     })
                     if resp.status_code == 200:

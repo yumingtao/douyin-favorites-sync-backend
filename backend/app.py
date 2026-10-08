@@ -303,9 +303,9 @@ def _extract_douyin_url(raw: str) -> str:
     return m.group(0) if m else raw
 
 
-def _run_extract(payload: ExtractRequest) -> tuple[dict[str, Any], dict[str, Any], str]:
+async def _run_extract(payload: ExtractRequest) -> tuple[dict[str, Any], dict[str, Any], str]:
     url = _extract_douyin_url(payload.url)
-    result = (
+    result = await (
         extract_heavy(url, OUTPUT_DIR, whisper_model=payload.model)
         if payload.mode == "heavy"
         else extract_light(url)
@@ -320,7 +320,7 @@ async def _run_extract_job(job_id: str, payload: ExtractRequest) -> None:
     job.update({"status": "running", "progress": 10, "stage": "解析输入和准备任务", "updated_at": local_now()})
     try:
         job.update({"progress": 35, "stage": "执行提取；heavy 模式会下载视频并转写音频", "updated_at": local_now()})
-        result, details, summary = await asyncio.to_thread(_run_extract, payload)
+        result, details, summary = await _run_extract(payload)
         save_result = None
         if result.get("douyin_id"):
             existing = CONTENT.get(str(result["douyin_id"]))
