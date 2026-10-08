@@ -57,10 +57,18 @@ def _resolve_short_url(client: httpx.Client, url: str) -> str:
     """Follow 302 redirects to get the final douyin.com URL."""
     if "v.douyin.com" not in url and "iesdouyin.com" not in url:
         return url
-    resp = client.get(url, follow_redirects=True, headers={
-        "User-Agent": SIGN_SESSION_UA,
-    })
-    return str(resp.url)
+    try:
+        resp = client.get(url, follow_redirects=True, headers={
+            "User-Agent": SIGN_SESSION_UA,
+        })
+        return str(resp.url)
+    except Exception:
+        # SSL/网络问题时回退：从 URL 中提取 aweme_id 拼接直链
+        import re
+        m = re.search(r"/video/(\d+)", url)
+        if m:
+            return f"https://www.douyin.com/video/{m.group(1)}"
+        return url
 
 
 def _extract_aweme_id(final_url: str) -> str:
@@ -248,7 +256,7 @@ def download_video(url: str, dest: Path, settings: Settings) -> bool:
         "Cookie": cookie,
     }
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with httpx.Client(timeout=120, follow_redirects=True) as client:
+    with httpx.Client(timeout=120, follow_redirects=True, verify=False) as client:
         with client.stream("GET", url, headers=headers) as resp:
             if resp.status_code != 200:
                 return False
